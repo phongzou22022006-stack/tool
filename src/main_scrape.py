@@ -2,14 +2,14 @@
 Entry point cho JOB SCRAPE.
 Chạy bởi GitHub Actions mỗi 8 tiếng.
 
-Flow mới (schedule trực tiếp lên Facebook):
+Flow semi-auto review:
   1. Lấy tất cả source pages đang hoạt động (gộp theo group)
   2. Với mỗi group: scrape tất cả source pages qua Apify
-  3. Với mỗi bài mới (chưa đăng):
-     → Tính thời điểm hẹn giờ cho từng trang đích
-     → Upload + hẹn giờ thẳng lên Facebook (Facebook giữ bài, tự đăng)
-     → Lưu dedup để tránh đăng lại
-  4. KHÔNG cần job post riêng (main_post.py không cần nữa)
+  3. Với mỗi bài mới (chưa có trong dedup):
+     → Chạy safety filter
+     → Tạo AI summary / rewritten caption / hashtag / CTA suggestion
+     → Ghi vào tab pending_review để duyệt thủ công
+  4. Chỉ job scheduler riêng mới đăng các bài đã được approved
 """
 import logging
 import sys
@@ -24,6 +24,7 @@ if DB_BACKEND == "sheets":
         is_post_exists,
         save_dedup,
         save_log,
+        save_pending_review,
         update_source_page_scraped_at,
     )
 else:
@@ -36,8 +37,8 @@ else:
         update_source_page_scraped_at,
     )
 from src.apify_scraper import scrape_pages
-from src.fb_poster import FacebookPoster
-from src.post_scheduler import build_slots_for_dest, commit_schedule, max_posts_for_dest
+from src.post_scheduler import max_posts_for_dest
+from src.review_builder import build_candidate_from_post
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,7 +50,7 @@ logger = logging.getLogger("main_scrape")
 
 def run():
     logger.info("=" * 60)
-    logger.info("BẮT ĐẦU JOB SCRAPE + SCHEDULE")
+    logger.info("BẮT ĐẦU JOB SCRAPE + PENDING REVIEW")
     logger.info("=" * 60)
 
     all_pages = get_active_source_pages()
@@ -119,7 +120,7 @@ def run():
             logger.warning(f"  → Group {group_name} không có trang đích nào")
             continue
 
-        # Với mỗi trang đích → giới hạn số bài + tính lịch riêng
+        # Với mỗi trang đích → giới hạn số bài + tạo candidate
         for dest in destinations:
             dest_id   = dest["id"]
             dest_name = dest.get("fb_page_name", dest_id[:8])
@@ -127,45 +128,42 @@ def run():
 
             # Chỉ lấy top-N bài chưa dedup cho trang đích này
             dest_posts = new_posts[:limit]
-            slots      = build_slots_for_dest(dest, len(dest_posts))
-            scheduled_ok = 0
+            candidates = []
 
             logger.info(
-                f"  {dest_name}: lên lịch {len(dest_posts)}/{len(new_posts)} bài "
-                f"(max={limit}, interval={dest.get('post_interval_hours') or 2}h)"
+                f"  {dest_name}: tạo candidate cho {len(dest_posts)}/{len(new_posts)} bài "
+                f"(max={limit})"
             )
 
             for idx, (post, page) in enumerate(dest_posts):
                 fb_post_id = post["fb_post_id"]
-                slot       = slots[idx]
 
                 try:
-                    poster = FacebookPoster(
-                        page_id      = dest["fb_page_id"],
-                        access_token = dest["fb_access_token"],
+                    candidate = build_candidate_from_post(
+                        post=post,
+                        page=page,
+                        dest=dest,
+                        group_id=group_id,
                     )
-                    poster.post(
-                        content      = post.get("content") or "",
-                        image_urls   = post.get("image_urls") or [],
-                        video_url    = post.get("video_url"),
-                        reel_url     = post.get("reel_url"),
-                        scheduled_at = slot,
-                    )
+                    if candidate is None:
+                        logger.info(f"    Bài {idx+1} bị filter block, bỏ qua")
+                        continue
 
+                    candidates.append(candidate)
                     save_dedup(fb_post_id, page["id"], dest_id)
                     save_log(
                         scheduled_post_id   = None,
                         fb_post_id          = fb_post_id,
                         destination_page_id = dest_id,
-                        result              = "scheduled",
+                        result              = "pending_review",
                         source_page_url     = page.get("fb_page_url", ""),
                         post_url            = post.get("post_url", ""),
                     )
-                    scheduled_ok += 1
+                    logger.info(f"    Bài {idx+1}: candidate OK, risk={candidate.filter_result.risk_level}")
 
                 except Exception as e:
                     logger.error(
-                        f"  Lỗi hẹn giờ bài {fb_post_id[:20]}... → {dest_name}: {e}"
+                        f"  Lỗi tạo candidate bài {fb_post_id[:20]}... → {dest_name}: {e}"
                     )
                     save_log(
                         scheduled_post_id   = None,
@@ -174,11 +172,13 @@ def run():
                         result              = "failed",
                         error_message       = str(e),
                         source_page_url     = page.get("fb_page_url", ""),
+                        post_url            = post.get("post_url", ""),
                     )
                     total_errors += 1
 
-            commit_schedule(dest_id, slots[:scheduled_ok])
-            logger.info(f"  {dest_name}: đã hẹn giờ {scheduled_ok}/{len(dest_posts)} bài")
+            if candidates:
+                save_pending_review([c.to_pending_review_row() for c in candidates])
+                logger.info(f"  {dest_name}: đã ghi {len(candidates)} candidate vào pending_review")
 
         total_new += len(new_posts)
 

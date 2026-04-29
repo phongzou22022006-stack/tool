@@ -66,10 +66,13 @@ jobs:
           print('clear_schedule:', r2.status_code, r2.text[:200])
           "
 
-      - name: Run scrape job
+      - name: Run scrape + pending review job
         env:
           DB_BACKEND: sheets
           GOOGLE_WEBAPP_URL: ${{ secrets.GOOGLE_WEBAPP_URL }}
           WEBAPP_SECRET: ${{ secrets.WEBAPP_SECRET }}
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_BASE_URL: ${{ secrets.AI_BASE_URL }}
+          AI_MODEL: ${{ secrets.AI_MODEL }}
           LOG_LEVEL: INFO
         run: python -m src.main_scrape

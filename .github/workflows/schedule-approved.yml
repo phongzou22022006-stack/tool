@@ -1,0 +1,30 @@
+name: Schedule Approved Facebook Posts
+
+on:
+  schedule:
+    - cron: '0 23,6,13 * * *'
+  workflow_dispatch:
+
+jobs:
+  schedule-approved:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Schedule approved posts
+        env:
+          DB_BACKEND: sheets
+          GOOGLE_WEBAPP_URL: ${{ secrets.GOOGLE_WEBAPP_URL }}
+          WEBAPP_SECRET: ${{ secrets.WEBAPP_SECRET }}
+          LOG_LEVEL: INFO
+        run: python -m src.main_post

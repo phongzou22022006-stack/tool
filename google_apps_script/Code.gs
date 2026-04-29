@@ -197,6 +197,7 @@ function setupSpreadsheet() {
   _createTab(ss, "dedup",    [["fb_post_id", "source_page_id", "destination_page_id", "posted_at"]]);
   _createTab(ss, "logs",     [["created_at", "fb_post_id", "destination_page_id", "result", "error_message"]]);
   _createTab(ss, "schedule", [["dest_page_id", "last_scheduled_at"]]);
+  _createPendingReviewTab(ss);
 
   var def = ss.getSheetByName("Sheet1");
   if (def && ss.getSheets().length > 1) ss.deleteSheet(def);
@@ -210,7 +211,7 @@ function setupSpreadsheet() {
   });
 
   SpreadsheetApp.getUi().alert(
-    "✅ Setup hoàn tất! 7 tabs đã được tạo.\n\n" +
+    "✅ Setup hoàn tất! 8 tabs đã được tạo.\n\n" +
     "Tiếp theo:\n" +
     "1. Deploy → New deployment → Web App\n" +
     "2. Execute as: Me | Who has access: Anyone\n" +
@@ -267,6 +268,9 @@ function _routeApi(action, params, body) {
     case "increment_apify_usage":    _incrementApifyUsage(SS, body.api_key, parseInt(body.count) || 1); return _json({ ok: true });
     case "update_source_scraped_at": _updateSourceScrapedAt(SS, body.page_url, body.scraped_at); return _json({ ok: true });
     case "save_log":                 _saveLog(SS, body.fb_post_id, body.destination_page_id, body.result, body.error_message || "", body.source_page_url || "", body.post_url || ""); return _json({ ok: true });
+    case "save_pending_review":      _savePendingReview(SS, body.rows || []); return _json({ ok: true });
+    case "get_approved_reviews":     return _json({ rows: _getApprovedReviews(SS, parseInt(params.limit || (body && body.limit) || 20)) });
+    case "update_review_status":     _updateReviewStatus(SS, body.id, body.status, body.fields || {}); return _json({ ok: true });
     case "clear_dedup":              _clearSheet(SS, "dedup"); return _json({ ok: true });
     case "clear_schedule":           _clearSheet(SS, "schedule"); return _json({ ok: true });
     default:                         return _err("Unknown action: " + action);
@@ -358,6 +362,93 @@ function _saveLog(SS, fbPostId, destPageId, result, errMsg, sourcePageUrl, postU
   if (header.indexOf("source_page_url") === -1) sh.getRange(1, lastCol + 1).setValue("source_page_url");
   if (header.indexOf("post_url") === -1) sh.getRange(1, sh.getLastColumn() + 1).setValue("post_url");
   sh.appendRow([new Date().toISOString(), String(fbPostId), String(destPageId), result, errMsg || "", sourcePageUrl || "", postUrl || ""]);
+}
+
+
+function _pendingReviewHeaders() {
+  return [
+    "id", "group_id", "destination_page_id", "source_page", "source_url",
+    "fb_post_id", "original_text", "ai_summary", "rewritten_caption",
+    "suggested_hashtags", "suggested_cta", "media_type", "media_urls",
+    "likes", "comments", "shares", "risk_level", "filter_result",
+    "filter_reasons", "status", "reviewed_by", "reviewed_at", "review_note",
+    "scheduled_time", "facebook_post_id", "created_at", "updated_at"
+  ];
+}
+
+function _createPendingReviewTab(SS) {
+  _createTab(SS, "pending_review", [_pendingReviewHeaders()]);
+}
+
+function _ensurePendingReviewTab(SS) {
+  var sh = SS.getSheetByName("pending_review");
+  if (!sh) {
+    _createPendingReviewTab(SS);
+    sh = SS.getSheetByName("pending_review");
+  }
+  var headers = _pendingReviewHeaders();
+  var existing = sh.getLastColumn() > 0 ? sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0] : [];
+  headers.forEach(function(h) {
+    if (existing.indexOf(h) === -1) {
+      sh.getRange(1, sh.getLastColumn() + 1).setValue(h);
+    }
+  });
+  return sh;
+}
+
+function _savePendingReview(SS, rows) {
+  var sh = _ensurePendingReviewTab(SS);
+  if (!Array.isArray(rows) || rows.length === 0) return;
+  var headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+  var existingIds = {};
+  var vals = sh.getDataRange().getValues();
+  var idCol = headers.indexOf("id");
+  for (var i = 1; i < vals.length; i++) existingIds[String(vals[i][idCol])] = true;
+  var out = [];
+  rows.forEach(function(row) {
+    if (existingIds[String(row.id)]) return;
+    out.push(headers.map(function(h) { return row[h] !== undefined ? row[h] : ""; }));
+  });
+  if (out.length) sh.getRange(sh.getLastRow() + 1, 1, out.length, headers.length).setValues(out);
+}
+
+function _getApprovedReviews(SS, limit) {
+  var sh = _ensurePendingReviewTab(SS);
+  var vals = sh.getDataRange().getValues();
+  if (vals.length <= 1) return [];
+  var headers = vals[0], statusCol = headers.indexOf("status"), out = [];
+  var destRows = _getAllRows(SS, "destination_pages");
+  var destMap = {};
+  destRows.forEach(function(r) { destMap[String(r.fb_page_id)] = r; });
+  for (var i = 1; i < vals.length && out.length < (limit || 20); i++) {
+    if (String(vals[i][statusCol]).toLowerCase() === "approved") {
+      var row = {};
+      headers.forEach(function(h, j) { row[h] = vals[i][j]; });
+      row._sheet_row = i + 1;
+      var dest = destMap[String(row.destination_page_id)] || {};
+      row.fb_access_token = dest.fb_access_token || "";
+      row.fb_page_name = dest.fb_page_name || "";
+      out.push(row);
+    }
+  }
+  return out;
+}
+
+function _updateReviewStatus(SS, id, status, fields) {
+  var sh = _ensurePendingReviewTab(SS);
+  var vals = sh.getDataRange().getValues();
+  var headers = vals[0], idCol = headers.indexOf("id"), statusCol = headers.indexOf("status");
+  for (var i = 1; i < vals.length; i++) {
+    if (String(vals[i][idCol]) === String(id)) {
+      sh.getRange(i + 1, statusCol + 1).setValue(status);
+      Object.keys(fields || {}).forEach(function(k) {
+        var c = headers.indexOf(k);
+        if (c !== -1) sh.getRange(i + 1, c + 1).setValue(fields[k]);
+      });
+      return;
+    }
+  }
+  throw new Error("Không tìm thấy pending_review id: " + id);
 }
 
 function _resetMonthlyUsageIfNeeded(SS) {

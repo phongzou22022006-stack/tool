@@ -1,24 +1,25 @@
 """
-Entry point cho JOB POST.
-Chạy bởi GitHub Actions mỗi 30 phút.
+Entry point cho JOB POST APPROVED.
+Chạy bởi GitHub Actions theo lịch riêng.
 
 Flow:
-  1. Lấy tất cả bài đã đến giờ đăng (scheduled_at <= now)
-  2. Đăng từng bài lên Facebook Page tương ứng
-  3. Cleanup: xóa content khỏi Supabase, lưu dedup
+  1. Lấy các dòng pending_review có status=approved
+  2. Đăng/hẹn giờ từng bài lên Facebook Page tương ứng
+  3. Cập nhật trạng thái scheduled hoặc failed
 """
 import logging
 import sys
+from datetime import datetime, timedelta, timezone
 
-from src.database import (
-    get_due_scheduled_posts,
-    mark_scheduled_post_done,
-    mark_scheduled_post_failed,
-)
+from src.config import DB_BACKEND
+
+if DB_BACKEND == "sheets":
+    from src.sheets_db import get_approved_reviews, update_review_status, save_log
+else:
+    raise RuntimeError("Semi-auto review MVP hiện chỉ hỗ trợ DB_BACKEND=sheets")
+
 from src.fb_poster import FacebookPoster
-from src.cleanup import cleanup_after_post
 
-# Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -26,101 +27,113 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main_post")
 
-# Số lần retry tối đa trước khi bỏ qua bài
-MAX_RETRY = 3
+
+def compute_schedule_time(index: int) -> datetime:
+    now = datetime.now(timezone.utc)
+    candidate = now + timedelta(minutes=15 + index * 10)
+    bangkok_hour = (candidate.hour + 7) % 24
+    if bangkok_hour >= 23 or bangkok_hour < 7:
+        target_date = candidate.date()
+        if bangkok_hour >= 23:
+            target_date = (candidate + timedelta(days=1)).date()
+        candidate = datetime(target_date.year, target_date.month, target_date.day, 0, 5, tzinfo=timezone.utc)
+    return candidate
 
 
 def run():
     logger.info("=" * 60)
-    logger.info("BẮT ĐẦU JOB POST")
+    logger.info("BẮT ĐẦU JOB POST APPROVED")
     logger.info("=" * 60)
 
-    due_posts = get_due_scheduled_posts()
-
-    if not due_posts:
-        logger.info("Không có bài nào cần đăng lúc này.")
+    rows = get_approved_reviews(limit=20)
+    if not rows:
+        logger.info("Không có bài approved nào. Thoát.")
         return
 
-    logger.info(f"Tìm thấy {len(due_posts)} bài cần đăng")
+    total_ok = 0
+    total_errors = 0
 
-    success_count = 0
-    fail_count    = 0
-
-    for item in due_posts:
-        scheduled_post_id   = item["id"]
-        post                = item.get("posts") or {}
-        dest                = item.get("destination_pages") or {}
-
-        fb_post_id          = post.get("fb_post_id", "")
-        content             = post.get("content") or ""
-        image_urls          = post.get("image_urls") or []
-        video_url           = post.get("video_url")
-        source_page_id      = post.get("source_page_id", "")
-        destination_page_id = item.get("destination_page_id", "")
-        fb_page_id          = dest.get("fb_page_id", "")
-        access_token        = dest.get("fb_access_token", "")
-        retry_count         = item.get("retry_count", 0)
-
-        # Bỏ qua nếu thiếu thông tin cần thiết
-        if not fb_page_id or not access_token:
-            logger.error(f"Thiếu page_id hoặc token cho dest {destination_page_id[:8]}...")
-            mark_scheduled_post_failed(scheduled_post_id)
-            fail_count += 1
-            continue
-
-        # Bỏ qua nếu đã retry quá nhiều lần
-        if retry_count >= MAX_RETRY:
-            logger.warning(f"Bài {fb_post_id[:20]}... đã retry {retry_count} lần, bỏ qua")
-            mark_scheduled_post_failed(scheduled_post_id)
-            fail_count += 1
-            continue
-
-        # Đăng bài
-        logger.info(f"Đang đăng: {fb_post_id[:20]}... → Page {fb_page_id}")
+    for idx, row in enumerate(rows):
         try:
+            schedule_time = compute_schedule_time(idx)
             poster = FacebookPoster(
-                page_id      = fb_page_id,
-                access_token = access_token,
+                page_id=str(row["destination_page_id"]),
+                access_token=str(_require(row, "fb_access_token")),
             )
-            new_fb_post_id = poster.post(
-                content    = content,
-                image_urls = image_urls if isinstance(image_urls, list) else [],
-                video_url  = video_url,
+            fb_created_id = poster.post(
+                content=str(row.get("rewritten_caption") or row.get("original_text") or ""),
+                image_urls=_split_lines(row.get("media_urls", "")) if str(row.get("media_type", "")) == "image" else [],
+                video_url=_pick_video_url(row),
+                reel_url=_pick_reel_url(row),
+                scheduled_at=schedule_time,
             )
-
-            logger.info(f"  ✓ Đăng thành công → FB post ID: {new_fb_post_id}")
-            mark_scheduled_post_done(scheduled_post_id)
-            cleanup_after_post(
-                scheduled_post_id   = scheduled_post_id,
-                post_id             = post.get("id", ""),
-                fb_post_id          = fb_post_id,
-                source_page_id      = source_page_id,
-                destination_page_id = destination_page_id,
-                success             = True,
+            update_review_status(
+                str(row["id"]),
+                "scheduled",
+                {
+                    "scheduled_time": schedule_time.isoformat(),
+                    "facebook_post_id": fb_created_id,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
             )
-            success_count += 1
-
+            save_log(
+                scheduled_post_id=None,
+                fb_post_id=str(row.get("fb_post_id") or ""),
+                destination_page_id=str(row["destination_page_id"]),
+                result="scheduled",
+                source_page_url=str(row.get("source_url") or ""),
+                post_url=str(row.get("source_url") or ""),
+            )
+            total_ok += 1
         except Exception as e:
-            error_msg = str(e)
-            logger.error(f"  ✗ Đăng thất bại: {error_msg}")
-            mark_scheduled_post_failed(scheduled_post_id)
-            cleanup_after_post(
-                scheduled_post_id   = scheduled_post_id,
-                post_id             = post.get("id", ""),
-                fb_post_id          = fb_post_id,
-                source_page_id      = source_page_id,
-                destination_page_id = destination_page_id,
-                success             = False,
-                error_msg           = error_msg,
+            total_errors += 1
+            logger.error(f"Lỗi post approved id={row.get('id')}: {e}")
+            update_review_status(
+                str(row.get("id")),
+                "failed",
+                {
+                    "review_note": f"schedule failed: {type(e).__name__}",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
             )
-            fail_count += 1
+            save_log(
+                scheduled_post_id=None,
+                fb_post_id=str(row.get("fb_post_id") or ""),
+                destination_page_id=str(row.get("destination_page_id") or ""),
+                result="failed",
+                error_message=str(e),
+                source_page_url=str(row.get("source_url") or ""),
+                post_url=str(row.get("source_url") or ""),
+            )
 
-    logger.info("\n" + "=" * 60)
-    logger.info(f"KẾT THÚC POST: ✓ {success_count} thành công | ✗ {fail_count} thất bại")
-    logger.info("=" * 60)
-
-    if fail_count > 0 and success_count == 0:
+    logger.info(f"KẾT THÚC JOB POST APPROVED: ok={total_ok} errors={total_errors}")
+    if total_errors > 0 and total_ok == 0:
         sys.exit(1)
+
+
+def _split_lines(value: str) -> list[str]:
+    return [x.strip() for x in str(value or "").splitlines() if x.strip()]
+
+
+def _pick_video_url(row: dict) -> str | None:
+    if str(row.get("media_type", "")) != "video":
+        return None
+    lines = _split_lines(row.get("media_urls", ""))
+    return lines[0] if lines else None
+
+
+def _pick_reel_url(row: dict) -> str | None:
+    if str(row.get("media_type", "")) != "reel":
+        return None
+    lines = _split_lines(row.get("media_urls", ""))
+    return lines[0] if lines else None
+
+
+def _require(row: dict, key: str) -> str:
+    value = row.get(key)
+    if not value:
+        raise RuntimeError(f"Thiếu field bắt buộc: {key}")
+    return str(value)
 
 
 if __name__ == "__main__":

@@ -116,6 +116,23 @@ def save_log(scheduled_post_id: str | None, fb_post_id: str,
           post_url=post_url or "")
 
 
+# ── Pending Review ─────────────────────────────────────────
+
+def save_pending_review(rows: list[dict]):
+    if not rows:
+        return
+    _post("save_pending_review", rows=rows)
+
+
+def get_approved_reviews(limit: int = 20) -> list[dict]:
+    result = _get("get_approved_reviews", limit=str(limit))
+    return result.get("rows", [])
+
+
+def update_review_status(row_id: str, status: str, fields: dict | None = None):
+    _post("update_review_status", id=row_id, status=status, fields=fields or {})
+
+
 # ── Apify Keys ─────────────────────────────────────────────
 
 def get_active_apify_key(_safe_limit: int = 450) -> str | None:

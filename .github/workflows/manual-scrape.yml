@@ -1,0 +1,66 @@
+name: Manual Scrape Review Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      clear_dedup:
+        description: Xoa dedup truoc khi chay?
+        required: false
+        default: 'false'
+
+jobs:
+  scrape-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      DB_BACKEND: sheets
+      GOOGLE_WEBAPP_URL: ${{ secrets.GOOGLE_WEBAPP_URL }}
+      WEBAPP_SECRET: ${{ secrets.WEBAPP_SECRET }}
+      AI_API_KEY: ${{ secrets.AI_API_KEY }}
+      AI_BASE_URL: ${{ secrets.AI_BASE_URL }}
+      AI_MODEL: ${{ secrets.AI_MODEL }}
+      LOG_LEVEL: INFO
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Setup ffmpeg
+        uses: FedericoCarboni/setup-ffmpeg@v3
+        with:
+          ffmpeg-version: release
+          github-token: ${{ github.token }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Tao Facebook cookies file
+        env:
+          FACEBOOK_COOKIES: ${{ secrets.FACEBOOK_COOKIES }}
+        run: |
+          if [ -n "$FACEBOOK_COOKIES" ]; then
+            echo "$FACEBOOK_COOKIES" > /tmp/fb_cookies.txt
+            echo "FACEBOOK_COOKIE_FILE=/tmp/fb_cookies.txt" >> $GITHUB_ENV
+          fi
+
+      - name: Clear dedup neu duoc yeu cau
+        if: ${{ github.event.inputs.clear_dedup == 'true' }}
+        run: |
+          python - <<'PY'
+          import os, httpx
+          url = os.environ['GOOGLE_WEBAPP_URL']
+          secret = os.environ['WEBAPP_SECRET']
+          for action in ('clear_dedup', 'clear_schedule'):
+              r = httpx.post(url, params={'token': secret}, json={'action': action}, follow_redirects=True, timeout=30)
+              print(action, r.status_code, r.text[:300])
+          PY
+
+      - name: Run scrape review job
+        run: python -m src.main_scrape
